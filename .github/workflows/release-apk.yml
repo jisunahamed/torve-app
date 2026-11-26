@@ -1,0 +1,160 @@
+name: Release signed Android APK
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      validation_only:
+        type: boolean
+        default: false
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published release tag, or v0.0.0-ci for validation only
+        required: true
+        type: string
+      validation_only:
+        description: Build selected workflow ref without creating or uploading to a release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-apk-${{ inputs.validation_only && github.ref || github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      VALIDATION_ONLY: ${{ inputs.validation_only || false }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      # Public fingerprint of the first permanent production certificate.
+      RELEASE_CERT_SHA256: e5b0406c0f92a7923f92437df63c4f9a063a6d446bb4301ccd69e65604b8838f
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate release and signing inputs
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || { echo '::error::Expected a version tag such as v1.0.0'; exit 1; }
+          for name in KEYSTORE_BASE64 STORE_PASSWORD KEY_PASSWORD; do
+            [[ -n "${!name}" ]] || { echo "::error::Missing signing secret: $name (see RELEASE_GUIDE.md)"; exit 1; }
+          done
+          if [[ "$VALIDATION_ONLY" != true ]]; then
+            gh release view "$RELEASE_TAG" --json id,isDraft,tagName > "$RUNNER_TEMP/torve-release.json"
+            jq -e --arg tag "$RELEASE_TAG" '.isDraft == false and .tagName == $tag' "$RUNNER_TEMP/torve-release.json"
+          fi
+          umask 077
+          export KEYSTORE_PATH="$RUNNER_TEMP/torve-release.jks"
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
+
+      - name: Checkout exact release tag or validation commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.validation_only && github.sha || format('refs/tags/{0}', github.event.release.tag_name || inputs.tag) }}
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle and validate wrapper
+        uses: gradle/actions/setup-gradle@7ca78c16c887dc6c5f36fd6d0cb0f5c23d940e69 # v6
+        with:
+          cache-disabled: true
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          # Feed enough answers without masking sdkmanager failures or SIGPIPE from yes.
+          "$SDKMANAGER" --licenses < <(printf 'y\n%.0s' {1..100}) > /dev/null
+          "$SDKMANAGER" --list > "$RUNNER_TEMP/torve-sdk-packages.txt"
+          grep -F 'platforms;android-36.1' "$RUNNER_TEMP/torve-sdk-packages.txt"
+          "$SDKMANAGER" 'platforms;android-36.1' 'build-tools;36.0.0' 'platform-tools'
+
+      - name: Validate signing key and build release
+        run: |
+          set -euo pipefail
+          keytool -exportcert -alias upload -keystore "$KEYSTORE_PATH" -storepass:env STORE_PASSWORD -file "$RUNNER_TEMP/torve-release.der"
+          sha256sum "$RUNNER_TEMP/torve-release.der"
+          [[ "$(sha256sum "$RUNNER_TEMP/torve-release.der" | cut -d ' ' -f 1)" == "$RELEASE_CERT_SHA256" ]] || { echo '::error::Keystore does not contain the permanent production certificate'; exit 1; }
+          # Existing AI Studio configuration requires this separate debug key for unit tests.
+          # It is never assigned to the release variant.
+          keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Android Debug,O=Android,C=US'
+          ./gradlew --version
+          ./gradlew --no-daemon --no-configuration-cache :app:testDebugUnitTest :app:assembleRelease
+
+      - name: Verify APK and create checksum
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -type f)
+          [[ ${#apks[@]} -eq 1 ]] || { echo '::error::Expected exactly one release APK'; exit 1; }
+          mkdir -p dist
+          apk="Torve-AI-${RELEASE_TAG}.apk"
+          cp "${apks[0]}" "dist/$apk"
+          test -s "dist/$apk"
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          "$tools/apksigner" verify --verbose --print-certs "dist/$apk" | tee "$RUNNER_TEMP/torve-signature.txt"
+          expected=$(sha256sum "$RUNNER_TEMP/torve-release.der" | cut -d ' ' -f 1)
+          actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/torve-signature.txt")
+          [[ "$actual" == "$expected" ]] || { echo '::error::APK certificate does not match release keystore'; exit 1; }
+          "$tools/aapt" dump badging "dist/$apk" > "$RUNNER_TEMP/torve-badging.txt"
+          grep -E "^package: name='com\.aistudio\.torveai\.kxtrva' " "$RUNNER_TEMP/torve-badging.txt"
+          grep -Fx "sdkVersion:'24'" "$RUNNER_TEMP/torve-badging.txt"
+          grep -Fx "targetSdkVersion:'36'" "$RUNNER_TEMP/torve-badging.txt"
+          if grep -q '^application-debuggable' "$RUNNER_TEMP/torve-badging.txt"; then
+            echo '::error::Refusing a debuggable APK'; exit 1
+          fi
+          (cd dist && sha256sum "$apk" > "$apk.sha256" && sha256sum --check "$apk.sha256")
+
+      - name: Upload and verify assets on the same release
+        if: env.VALIDATION_ONLY != 'true'
+        run: |
+          set -euo pipefail
+          # Refuse a deleted/recreated release between preflight and upload.
+          release_id=$(jq -r .id "$RUNNER_TEMP/torve-release.json")
+          [[ "$(gh release view "$RELEASE_TAG" --json id --jq .id)" == "$release_id" ]]
+          gh release upload "$RELEASE_TAG" "dist/Torve-AI-${RELEASE_TAG}.apk" "dist/Torve-AI-${RELEASE_TAG}.apk.sha256" --clobber
+          mkdir -p "$RUNNER_TEMP/torve-downloaded"
+          gh release download "$RELEASE_TAG" --pattern "Torve-AI-${RELEASE_TAG}.apk*" --dir "$RUNNER_TEMP/torve-downloaded"
+          cmp "dist/Torve-AI-${RELEASE_TAG}.apk.sha256" "$RUNNER_TEMP/torve-downloaded/Torve-AI-${RELEASE_TAG}.apk.sha256"
+          (cd "$RUNNER_TEMP/torve-downloaded" && sha256sum --check "Torve-AI-${RELEASE_TAG}.apk.sha256")
+          cmp "dist/Torve-AI-${RELEASE_TAG}.apk" "$RUNNER_TEMP/torve-downloaded/Torve-AI-${RELEASE_TAG}.apk"
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '.assets[] | .browser_download_url'
+
+      - name: Retain validation APK and checksum
+        if: env.VALIDATION_ONLY == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: torve-release-validation-${{ github.run_id }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/torve-release.jks" "$RUNNER_TEMP/torve-release.der" debug.keystore
