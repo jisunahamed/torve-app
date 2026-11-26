@@ -36,8 +36,11 @@ import com.example.feature.inbox.InboxScreen
 import com.example.feature.inbox.InboxViewModel
 import com.example.feature.preview.LivePreviewScreen
 import com.example.feature.preview.WorkspaceExplorerScreen
+import com.example.feature.skills.SkillsManagerScreen
 import com.example.ui.theme.TorveAiTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -54,6 +57,9 @@ data class LivePreviewRoute(val workspaceId: String, val port: Int = 8080)
 
 @Serializable
 data class WorkspaceExplorerRoute(val workspaceId: String)
+
+@Serializable
+data object SkillsRoute
 
 @Serializable
 data object UsageRoute
@@ -120,6 +126,13 @@ private fun TorveAppNavHost(
     val scope = rememberCoroutineScope()
     val sessionState by container.authRepository.sessionState.collectAsStateWithLifecycle()
     val runningServers by container.devServerManager.runningServers.collectAsStateWithLifecycle()
+    val allSkills by container.skillRegistry.skills.collectAsStateWithLifecycle()
+
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            container.skillRegistry.syncDisabledStateAndRefresh()
+        }
+    }
 
     val startDestination: Any = if (sessionState.isAuthenticated) InboxRoute else AuthRoute
 
@@ -163,9 +176,11 @@ private fun TorveAppNavHost(
             InboxScreen(
                 viewModel = inboxVm,
                 sessionState = sessionState,
+                enabledSkillsCount = allSkills.count { it.enabled },
                 onOpenThread = { threadId -> navController.navigate(ChatRoute(threadId)) },
                 onOpenWorkspaceExplorer = { wsId -> navController.navigate(WorkspaceExplorerRoute(wsId)) },
                 onOpenLivePreview = { wsId, port -> navController.navigate(LivePreviewRoute(wsId, port)) },
+                onOpenSkills = { navController.navigate(SkillsRoute) },
                 onOpenUsage = { navController.navigate(UsageRoute) },
                 onOpenSettings = { navController.navigate(SettingsRoute) },
                 onSignOut = {
@@ -174,6 +189,13 @@ private fun TorveAppNavHost(
                         container.authRepository.signOut()
                     }
                 }
+            )
+        }
+
+        composable<SkillsRoute> {
+            SkillsManagerScreen(
+                skillRegistry = container.skillRegistry,
+                onNavigateBack = { navController.popBackStack() }
             )
         }
 
