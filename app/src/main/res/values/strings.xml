@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Torve AI</string>
+    <string name="auth_hero_title">Agentic Harness on Android</string>
+    <string name="auth_hero_subtitle">Streaming reasoning, isolated on-device Linux sandbox, and instant localhost live preview.</string>
+    <string name="auth_continue_browser">Continue with Torve AI</string>
+    <string name="auth_or_api_key">Or sign in with API Key</string>
+    <string name="auth_api_key_label">Torve API Key (sk-trv-...)</string>
+    <string name="auth_validate_connect">Validate &amp; Connect</string>
+    <string name="auth_open_dashboard">Open Torve Dashboard</string>
+    <string name="inbox_search_placeholder">Search chats &amp; workspaces</string>
+    <string name="inbox_new_task">New Task</string>
+    <string name="nav_all_threads">All Threads</string>
+    <string name="nav_workspaces">Workspaces</string>
+    <string name="nav_running_servers">Running Servers</string>
+    <string name="nav_usage_plan">Usage &amp; Plan</string>
+    <string name="nav_settings">Settings</string>
+    <string name="sandbox_notification_channel_name">Torve Sandbox Runtime</string>
+    <string name="sandbox_notification_channel_desc">Keeps on-device sandbox tasks and local development servers alive.</string>
+    <string name="cd_torve_logo">Torve AI logo</string>
+    <string name="cd_open_drawer">Open navigation drawer</string>
+    <string name="cd_account_badge">Open account and quota details</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_live_preview">Open localhost live preview</string>
+    <string name="cd_workspace_explorer">Open workspace files and terminal</string>
+    <string name="cd_attach_file">Attach file to workspace</string>
+    <string name="cd_send_message">Send message</string>
+    <string name="cd_stop_generation">Stop generation</string>
+</resources>

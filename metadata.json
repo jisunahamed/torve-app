@@ -1,0 +1,6 @@
+{
+  "name": "Torve AI",
+  "description": "On-device Android agentic development harness with Torve AI streaming inference, isolated local sandbox, and live localhost preview.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

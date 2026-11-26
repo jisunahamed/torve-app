@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- Outer luminous T + chevron prism frame -->
+    <path
+        android:pathData="M9,11 L39,11 L39,17.5 L28.5,17.5 L37.5,27.5 L21,41 L19,41 L19,17.5 L9,17.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="39"
+                android:endY="41"
+                android:startX="9"
+                android:startY="11"
+                android:type="linear">
+                <item android:color="#6366F1" android:offset="0.0" />
+                <item android:color="#22D3EE" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Inner crisp white precision T + prism stroke -->
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M11.5,13.2 L36.5,13.2 L36.5,15.3 L24.5,15.3 L34.2,27.2 L21.5,37.8 L21.5,15.3 L11.5,15.3 Z" />
+    <!-- Inner obsidian triangular cutout -->
+    <path
+        android:fillColor="#0B0F17"
+        android:pathData="M24,18.8 L30.6,27 L24,32.6 Z" />
+    <!-- Inner electric cyan triangle accent -->
+    <path
+        android:fillColor="#22D3EE"
+        android:pathData="M25.5,22.4 L28.7,26.5 L25.5,29.3 Z" />
+</vector>
