@@ -34,7 +34,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Language
@@ -78,6 +81,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.core.database.MessageEntity
 import com.example.core.database.ToolCallLogEntity
+import com.example.feature.skills.AgentSkill
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.TorveAmber
 import com.example.ui.theme.TorveCyan
@@ -98,6 +102,32 @@ fun ChatScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     var promptInput by remember { mutableStateOf("") }
     var showModelSheet by remember { mutableStateOf(false) }
+
+    val slashCandidates = remember(promptInput, uiState.enabledSkills) {
+        val trimmed = promptInput.trimStart()
+        if (!trimmed.startsWith("/") || trimmed.contains(" ") || trimmed.contains("\n")) {
+            emptyList()
+        } else {
+            val token = trimmed.lowercase()
+            uiState.enabledSkills.filter { skill ->
+                skill.primarySlashCommand.lowercase().startsWith(token) ||
+                    "/${skill.name}".lowercase().startsWith(token) ||
+                    skill.triggers.any { it.lowercase().startsWith(token) } ||
+                    token == "/"
+            }
+        }
+    }
+
+    val composerMatchedSkill = remember(promptInput, uiState.enabledSkills) {
+        val trimmed = promptInput.trimStart()
+        if (!trimmed.startsWith("/")) return@remember null
+        val firstToken = trimmed.substringBefore(" ").substringBefore("\n").trim()
+        if (firstToken.length < 2) return@remember null
+        uiState.enabledSkills.firstOrNull { skill ->
+            skill.triggers.any { it.equals(firstToken, ignoreCase = true) } ||
+                "/${skill.name}".equals(firstToken, ignoreCase = true)
+        }
+    }
 
     val attachLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -301,9 +331,18 @@ fun ChatScreen(
                     ) {
                         items(uiState.messages, key = { it.id }) { message ->
                             val logs = uiState.toolLogsByMessageId[message.id].orEmpty()
+                            val inferredSkillName = remember(message.id, logs, uiState.runState.activeSkillName) {
+                                logs.firstOrNull { it.toolName == "load_skill" }
+                                    ?.summary
+                                    ?.substringAfter("Loaded skill ", "")
+                                    ?.substringBefore(" ")
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?: if (message.isStreaming) uiState.runState.activeSkillName else null
+                            }
                             ChatMessageBubble(
                                 message = message,
-                                toolLogs = logs
+                                toolLogs = logs,
+                                activeSkillName = inferredSkillName
                             )
                         }
 
@@ -361,7 +400,17 @@ fun ChatScreen(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-            // Bottom Composer Bar with Compact Model Switcher Pill
+            // Slash-Command Autocomplete Popup above the Composer
+            AnimatedVisibility(visible = slashCandidates.isNotEmpty()) {
+                SlashCommandPopup(
+                    skills = slashCandidates,
+                    onSelectSkill = { skill ->
+                        promptInput = "${skill.primarySlashCommand} "
+                    }
+                )
+            }
+
+            // Bottom Composer Bar with Compact Model Switcher Pill, Chat-Only Indicator & Active Skill Pill
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -370,55 +419,89 @@ fun ChatScreen(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Model Switcher Pill + Active Step Counter
+                // Model Switcher Pill + Chat-Only Mode Indicator + Active Step Counter
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(999.dp),
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                        modifier = Modifier
-                            .clickable { showModelSheet = true }
-                            .testTag("model_switcher_pill")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.weight(1f, fill = false)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        Surface(
+                            shape = RoundedCornerShape(999.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            modifier = Modifier
+                                .clickable { showModelSheet = true }
+                                .testTag("model_switcher_pill")
                         ) {
-                            Text(
-                                text = uiState.selectedModel?.displayName
-                                    ?: uiState.selectedModelId.ifBlank { "Select Model" },
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            if (uiState.selectedModel?.supportsTools == true) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = uiState.selectedModel?.displayName
+                                        ?: uiState.selectedModelId.ifBlank { "Select Model" },
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (uiState.supportsTools) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Build,
+                                        contentDescription = "Tools enabled",
+                                        tint = TorveCyan,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                                if (uiState.selectedModel?.supportsReasoning == true) {
+                                    Icon(
+                                        imageVector = Icons.Filled.AutoAwesome,
+                                        contentDescription = "Reasoning enabled",
+                                        tint = TorveAmber,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
                                 Icon(
-                                    imageVector = Icons.Filled.Build,
-                                    contentDescription = "Tools enabled",
-                                    tint = TorveCyan,
-                                    modifier = Modifier.size(13.dp)
+                                    imageVector = Icons.Filled.KeyboardArrowDown,
+                                    contentDescription = "Switch model",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
-                            if (uiState.selectedModel?.supportsReasoning == true) {
-                                Icon(
-                                    imageVector = Icons.Filled.AutoAwesome,
-                                    contentDescription = "Reasoning enabled",
-                                    tint = TorveAmber,
-                                    modifier = Modifier.size(13.dp)
-                                )
+                        }
+
+                        if (!uiState.supportsTools) {
+                            Surface(
+                                shape = RoundedCornerShape(999.dp),
+                                color = TorveAmber.copy(alpha = 0.16f),
+                                border = BorderStroke(1.dp, TorveAmber.copy(alpha = 0.45f)),
+                                modifier = Modifier.testTag("chat_only_mode_pill")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.ChatBubbleOutline,
+                                        contentDescription = null,
+                                        tint = TorveAmber,
+                                        modifier = Modifier.size(12.dp)
+                                    )
+                                    Text(
+                                        text = "Chat-Only Mode",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TorveAmber,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
                             }
-                            Icon(
-                                imageVector = Icons.Filled.KeyboardArrowDown,
-                                contentDescription = "Switch model",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(16.dp)
-                            )
                         }
                     }
 
@@ -427,6 +510,22 @@ fun ChatScreen(
                             text = "Step ${uiState.runState.currentStep}/${uiState.runState.maxSteps}",
                             style = MaterialTheme.typography.labelSmall,
                             color = TorveCyan
+                        )
+                    }
+                }
+
+                // Active Skill Pill (either typed via /command or currently running in harness)
+                val displayedSkillName = composerMatchedSkill?.name ?: uiState.runState.activeSkillName
+                AnimatedVisibility(visible = displayedSkillName != null) {
+                    displayedSkillName?.let { skillName ->
+                        ActiveSkillPill(
+                            skillName = skillName,
+                            onClear = if (composerMatchedSkill != null) {
+                                {
+                                    val firstToken = promptInput.trimStart().substringBefore(" ")
+                                    promptInput = promptInput.trimStart().removePrefix(firstToken).trimStart()
+                                }
+                            } else null
                         )
                     }
                 }
@@ -463,7 +562,11 @@ fun ChatScreen(
                         ) {
                             if (promptInput.isEmpty()) {
                                 Text(
-                                    text = "Ask Torve AI to build, edit, or run...",
+                                    text = if (uiState.supportsTools) {
+                                        "Type / for skills, or ask Torve AI to build..."
+                                    } else {
+                                        "Chat-Only Mode — ask Torve AI anything..."
+                                    },
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -546,9 +649,126 @@ fun ChatScreen(
 }
 
 @Composable
+private fun SlashCommandPopup(
+    skills: List<AgentSkill>,
+    onSelectSkill: (AgentSkill) -> Unit
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, TorveIndigo.copy(alpha = 0.4f)),
+        shape = RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp),
+        tonalElevation = 4.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("slash_command_popup")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                text = "AGENT SKILLS",
+                style = MaterialTheme.typography.labelSmall,
+                color = TorveCyan,
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+            skills.take(5).forEach { skill ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { onSelectSkill(skill) }
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
+                        .testTag("slash_command_item_${skill.name}"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = TorveIndigo.copy(alpha = 0.22f)
+                    ) {
+                        Text(
+                            text = skill.primarySlashCommand,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontFamily = JetBrainsMonoFamily,
+                            color = TorveCyan,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = skill.name,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = skill.description,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveSkillPill(
+    skillName: String,
+    onClear: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = TorveIndigo.copy(alpha = 0.18f),
+        border = BorderStroke(1.dp, TorveCyan.copy(alpha = 0.5f)),
+        modifier = modifier.testTag("active_skill_pill_$skillName")
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Bolt,
+                contentDescription = null,
+                tint = TorveCyan,
+                modifier = Modifier.size(14.dp)
+            )
+            Text(
+                text = "Skill: $skillName",
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = JetBrainsMonoFamily,
+                color = TorveCyan,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (onClear != null) {
+                Icon(
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = "Clear active skill",
+                    tint = TorveCyan,
+                    modifier = Modifier
+                        .size(14.dp)
+                        .clickable(onClick = onClear)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun ChatMessageBubble(
     message: MessageEntity,
-    toolLogs: List<ToolCallLogEntity>
+    toolLogs: List<ToolCallLogEntity>,
+    activeSkillName: String? = null
 ) {
     val isUser = message.role == "user"
 
@@ -609,6 +829,9 @@ private fun ChatMessageBubble(
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurface
                         )
+                        if (!activeSkillName.isNullOrBlank()) {
+                            ActiveSkillPill(skillName = activeSkillName)
+                        }
                     }
 
                     if (message.promptTokens > 0 || message.completionTokens > 0) {
@@ -652,9 +875,9 @@ private fun ChatMessageBubble(
 @Composable
 private fun ChatStarterPrompts(onPickPrompt: (String) -> Unit) {
     val starters = listOf(
-        "Build a responsive portfolio website with HTML/CSS/JS, start a local server, and preview it live inside the app.",
-        "Create an interactive Pomodoro timer web app with dark glassmorphism UI and start the local server on port 8080.",
-        "Inspect the sandbox workspace environment with list_files and bash_exec."
+        "/web Build a responsive portfolio website with HTML/CSS/JS, start a local server, and preview it live.",
+        "/debug Inspect the workspace and diagnose any broken markup, styling, or scripts.",
+        "/explain Map out the sandbox workspace structure and summarize its files."
     )
 
     Column(
@@ -671,7 +894,7 @@ private fun ChatStarterPrompts(onPickPrompt: (String) -> Unit) {
         )
         Spacer(Modifier.height(6.dp))
         Text(
-            text = "Torve AI can write files, execute sandbox commands, and boot a local HTTP server for instant in-app preview.",
+            text = "Type / to trigger a modular Agent Skill, or ask Torve AI to write files, run shell commands, and boot a live localhost preview.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

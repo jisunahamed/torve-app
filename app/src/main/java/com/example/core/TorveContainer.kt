@@ -17,6 +17,7 @@ import com.example.feature.harness.HarnessToolRegistry
 import com.example.feature.sandbox.LocalDevServerManager
 import com.example.feature.sandbox.SandboxBootstrap
 import com.example.feature.sandbox.SandboxForegroundService
+import com.example.feature.skills.SkillRegistry
 import kotlinx.coroutines.flow.first
 import java.util.UUID
 
@@ -38,6 +39,11 @@ class TorveContainer(context: Context) {
     val preferencesStore = AppPreferencesStore(appContext)
 
     val sandboxBootstrap = SandboxBootstrap(appContext).also { it.ensureBootstrapped() }
+    val skillRegistry = SkillRegistry(
+        sandboxBootstrap = sandboxBootstrap,
+        preferencesStore = preferencesStore
+    ).also { it.ensureStarterSkillsInstalled() }
+
     val devServerManager = LocalDevServerManager(
         sandboxBootstrap = sandboxBootstrap,
         onServerCountChanged = { count ->
@@ -49,6 +55,7 @@ class TorveContainer(context: Context) {
         sandboxBootstrap = sandboxBootstrap,
         devServerManager = devServerManager,
         torveDao = torveDao,
+        skillRegistry = skillRegistry,
         json = json
     )
 
@@ -59,6 +66,7 @@ class TorveContainer(context: Context) {
         inferenceClient = inferenceClient,
         sandboxBootstrap = sandboxBootstrap,
         devServerManager = devServerManager,
+        skillRegistry = skillRegistry,
         toolRegistry = toolRegistry,
         json = json
     )

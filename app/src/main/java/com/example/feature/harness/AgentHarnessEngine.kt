@@ -8,12 +8,13 @@ import com.example.core.database.TorveDao
 import com.example.core.network.ChatMessageDto
 import com.example.core.network.InferenceStreamEvent
 import com.example.core.network.ToolCallDto
-import com.example.core.network.ToolCallFunctionDto
 import com.example.core.network.TorveInferenceClient
 import com.example.core.network.TorveModel
 import com.example.core.security.SecureTokenStore
 import com.example.feature.sandbox.LocalDevServerManager
 import com.example.feature.sandbox.SandboxBootstrap
+import com.example.feature.skills.AgentSkill
+import com.example.feature.skills.SkillRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -25,10 +26,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class PendingShellApproval(
     val toolLogId: String,
@@ -43,15 +48,15 @@ data class HarnessRunState(
     val currentStep: Int = 0,
     val maxSteps: Int = 20,
     val stepLimitReached: Boolean = false,
+    val activeSkillName: String? = null,
     val pendingApproval: PendingShellApproval? = null,
     val errorMessage: String? = null
 )
 
 /**
  * Native Kotlin Coroutines + StateFlow ReAct / Tool-Calling Agent Harness Engine.
- * Loop: User Prompt -> Context Assembly -> Streaming LLM (/v1/chat/completions)
- *       -> Incremental SSE Parser -> Optional Shell Approval Gate -> Sandbox Tool Executor
- *       -> Append Tool Result -> Loop until Final Answer or Max Steps.
+ * Supports progressive SKILL.md catalog disclosure, explicit slash-command skill injection,
+ * incremental multi-call SSE delta assembly, live streaming bash_exec cards, and approval gates.
  */
 class AgentHarnessEngine(
     private val torveDao: TorveDao,
@@ -60,6 +65,7 @@ class AgentHarnessEngine(
     private val inferenceClient: TorveInferenceClient,
     private val sandboxBootstrap: SandboxBootstrap,
     private val devServerManager: LocalDevServerManager,
+    private val skillRegistry: SkillRegistry,
     private val toolRegistry: HarnessToolRegistry,
     private val json: Json
 ) {
@@ -82,8 +88,16 @@ class AgentHarnessEngine(
 
         activeJob = engineScope.launch {
             val thread = torveDao.getThreadById(threadId) ?: return@launch
+            val workspaceDir = sandboxBootstrap.ensureWorkspaceDir(thread.workspaceId)
+            skillRegistry.syncDisabledStateAndRefresh(workspaceDir)
+
+            // Detect explicit slash-command skill invocation (e.g. "/web build a portfolio")
+            val slashMatch = skillRegistry.matchSlashCommand(trimmed, workspaceDir)
+            val explicitSkill = slashMatch?.first
+
             if (thread.title == "New Task" || thread.title.isBlank()) {
-                val autoTitle = trimmed.lines().first().take(48).trim()
+                val titleSource = slashMatch?.second?.ifBlank { trimmed } ?: trimmed
+                val autoTitle = titleSource.lines().first().take(48).trim()
                 if (autoTitle.isNotBlank()) {
                     torveDao.updateThreadTitle(threadId, autoTitle)
                 }
@@ -99,7 +113,12 @@ class AgentHarnessEngine(
             torveDao.upsertMessage(userMsg)
             torveDao.updateThreadActivity(threadId, trimmed.take(120), 0L)
 
-            runAgentLoop(threadId = threadId, model = model, modelId = modelId)
+            runAgentLoop(
+                threadId = threadId,
+                model = model,
+                modelId = modelId,
+                explicitSkill = explicitSkill
+            )
         }
     }
 
@@ -110,7 +129,12 @@ class AgentHarnessEngine(
     ) {
         stopGeneration()
         activeJob = engineScope.launch {
-            runAgentLoop(threadId = threadId, model = model, modelId = modelId)
+            runAgentLoop(
+                threadId = threadId,
+                model = model,
+                modelId = modelId,
+                explicitSkill = null
+            )
         }
     }
 
@@ -140,7 +164,8 @@ class AgentHarnessEngine(
     private suspend fun runAgentLoop(
         threadId: String,
         model: TorveModel?,
-        modelId: String
+        modelId: String,
+        explicitSkill: AgentSkill?
     ) {
         val apiKey = tokenStore.getApiKey()
         if (apiKey.isNullOrBlank()) {
@@ -155,17 +180,21 @@ class AgentHarnessEngine(
         val thread = torveDao.getThreadById(threadId) ?: return
         val workspace = torveDao.getWorkspaceById(thread.workspaceId) ?: return
         val workspaceDir = sandboxBootstrap.ensureWorkspaceDir(workspace.id)
+        skillRegistry.syncDisabledStateAndRefresh(workspaceDir)
+
         val settings = preferencesStore.settingsFlow.first()
         val maxSteps = settings.maxAgentSteps.coerceIn(5, 40)
         val allowTools = model?.supportsTools ?: true
         val tools = if (allowTools) toolRegistry.getToolDefinitions() else null
 
+        var activeSkill: AgentSkill? = explicitSkill
         _runState.value = HarnessRunState(
             activeThreadId = threadId,
             isRunning = true,
             currentStep = 0,
             maxSteps = maxSteps,
             stepLimitReached = false,
+            activeSkillName = explicitSkill?.name,
             errorMessage = null
         )
 
@@ -178,11 +207,11 @@ class AgentHarnessEngine(
                 val history = torveDao.getMessagesSnapshot(threadId)
                 val requestMessages = assembleContextMessages(
                     workspaceName = workspace.name,
-                    workspaceDirPath = workspaceDir.absolutePath,
-                    workspaceTree = toolRegistry.buildWorkspaceTreeSnapshot(workspaceDir),
+                    workspaceDir = workspaceDir,
                     runningServerPort = devServerManager.getServerForWorkspace(workspace.id)?.port,
                     history = history,
-                    allowTools = allowTools
+                    allowTools = allowTools,
+                    injectedSkill = activeSkill
                 )
 
                 val assistantMsgId = UUID.randomUUID().toString()
@@ -201,7 +230,7 @@ class AgentHarnessEngine(
 
                 val contentBuilder = StringBuilder()
                 val reasoningBuilder = StringBuilder()
-                val toolAccumulators = linkedMapOf<Int, MutableToolAccumulator>()
+                val toolAccumulator = SseToolCallAccumulator()
                 var promptTokens = 0
                 var completionTokens = 0
                 var streamError: String? = null
@@ -250,10 +279,12 @@ class AgentHarnessEngine(
                         }
 
                         is InferenceStreamEvent.ToolCallDelta -> {
-                            val acc = toolAccumulators.getOrPut(event.index) { MutableToolAccumulator() }
-                            if (!event.id.isNullOrBlank()) acc.id = event.id
-                            if (!event.name.isNullOrBlank()) acc.name = event.name
-                            if (!event.argumentsChunk.isNullOrEmpty()) acc.arguments.append(event.argumentsChunk)
+                            toolAccumulator.appendDelta(
+                                index = event.index,
+                                id = event.id,
+                                nameChunk = event.name,
+                                argumentsChunk = event.argumentsChunk
+                            )
                         }
 
                         is InferenceStreamEvent.UsageUpdate -> {
@@ -261,9 +292,7 @@ class AgentHarnessEngine(
                             completionTokens = event.completionTokens
                         }
 
-                        is InferenceStreamEvent.RateLimitRetry -> {
-                            // Handled reactively by RateLimitQueue.bannerState
-                        }
+                        is InferenceStreamEvent.RateLimitRetry -> Unit
 
                         is InferenceStreamEvent.Error -> {
                             streamError = event.message
@@ -273,20 +302,7 @@ class AgentHarnessEngine(
                     }
                 }
 
-                val finalizedToolCalls = toolAccumulators.entries
-                    .sortedBy { it.key }
-                    .mapNotNull { (idx, acc) ->
-                        val fnName = acc.name.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                        ToolCallDto(
-                            id = acc.id.ifBlank { "call_${step}_$idx" },
-                            type = "function",
-                            function = ToolCallFunctionDto(
-                                name = fnName,
-                                arguments = acc.arguments.toString().ifBlank { "{}" }
-                            )
-                        )
-                    }
-
+                val finalizedToolCalls = toolAccumulator.buildFinalizedToolCalls(stepNumber = step)
                 val toolCallsJson = if (finalizedToolCalls.isNotEmpty()) {
                     json.encodeToString(ListSerializer(ToolCallDto.serializer()), finalizedToolCalls)
                 } else null
@@ -318,13 +334,13 @@ class AgentHarnessEngine(
                     return
                 }
 
-                // If no tool calls were requested, the agent reached its final answer
-                if (finalizedToolCalls.isEmpty()) {
+                // If no tool calls were requested (or model is in Chat-Only Mode), end turn cleanly
+                if (finalizedToolCalls.isEmpty() || !allowTools) {
                     _runState.value = _runState.value.copy(isRunning = false, stepLimitReached = false)
                     return
                 }
 
-                // Execute each tool call sequentially inside the isolated workspace
+                // Execute every tool call in this turn and append a matching role="tool" message for each
                 val askBeforeShell = preferencesStore.settingsFlow.first().askBeforeShellCommands
                 for (tc in finalizedToolCalls) {
                     val toolLogId = UUID.randomUUID().toString()
@@ -358,7 +374,7 @@ class AgentHarnessEngine(
                         )
                         val approved = gate.await()
                         if (!approved) {
-                            val deniedMsg = "Shell command execution was denied by the user."
+                            val deniedMsg = """{"error":"Shell command execution was denied by the user."}"""
                             torveDao.updateToolCallResult(
                                 logId = toolLogId,
                                 output = deniedMsg,
@@ -387,6 +403,10 @@ class AgentHarnessEngine(
                         )
                     }
 
+                    // Serialize live stdout/stderr streaming updates so they never race final status
+                    val logUpdateMutex = Mutex()
+                    val toolFinished = AtomicBoolean(false)
+
                     val result = toolRegistry.executeTool(
                         workspaceId = workspace.id,
                         workspaceName = workspace.name,
@@ -394,25 +414,39 @@ class AgentHarnessEngine(
                         toolName = tc.function.name,
                         argumentsJson = tc.function.arguments,
                         onLiveOutput = { liveChunk ->
-                            engineScope.launch {
-                                torveDao.updateToolCallResult(
-                                    logId = toolLogId,
-                                    output = liveChunk,
-                                    diffContent = null,
-                                    status = ToolCallStatus.RUNNING,
-                                    durationMs = 0L
-                                )
+                            if (!toolFinished.get()) {
+                                engineScope.launch {
+                                    logUpdateMutex.withLock {
+                                        if (!toolFinished.get()) {
+                                            torveDao.updateToolCallResult(
+                                                logId = toolLogId,
+                                                output = liveChunk,
+                                                diffContent = null,
+                                                status = ToolCallStatus.RUNNING,
+                                                durationMs = 0L
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     )
 
-                    torveDao.updateToolCallResult(
-                        logId = toolLogId,
-                        output = result.output,
-                        diffContent = result.diffContent,
-                        status = if (result.isError) ToolCallStatus.ERROR else ToolCallStatus.SUCCESS,
-                        durationMs = result.durationMs
-                    )
+                    toolFinished.set(true)
+                    logUpdateMutex.withLock {
+                        torveDao.updateToolCallResult(
+                            logId = toolLogId,
+                            output = result.output,
+                            diffContent = result.diffContent,
+                            status = if (result.isError) ToolCallStatus.ERROR else ToolCallStatus.SUCCESS,
+                            durationMs = result.durationMs
+                        )
+                    }
+
+                    if (!result.loadedSkillName.isNullOrBlank()) {
+                        _runState.value = _runState.value.copy(activeSkillName = result.loadedSkillName)
+                        activeSkill = skillRegistry.loadSkillByName(result.loadedSkillName, workspaceDir) ?: activeSkill
+                    }
 
                     torveDao.upsertMessage(
                         MessageEntity(
@@ -433,7 +467,6 @@ class AgentHarnessEngine(
                 stepLimitReached = true
             )
         } catch (_: CancellationException) {
-            // Preserve partial content and mark streaming=false on any open message
             val latest = torveDao.getMessagesSnapshot(threadId).lastOrNull()
             if (latest != null && latest.isStreaming) {
                 torveDao.updateMessageContent(
@@ -458,12 +491,14 @@ class AgentHarnessEngine(
 
     private fun assembleContextMessages(
         workspaceName: String,
-        workspaceDirPath: String,
-        workspaceTree: String,
+        workspaceDir: File,
         runningServerPort: Int?,
         history: List<MessageEntity>,
-        allowTools: Boolean
+        allowTools: Boolean,
+        injectedSkill: AgentSkill?
     ): List<ChatMessageDto> {
+        val workspaceTree = toolRegistry.buildWorkspaceTreeSnapshot(workspaceDir)
+        val skillsCatalog = skillRegistry.buildCatalogPromptSection(workspaceDir)
         val serverNote = if (runningServerPort != null) {
             "Active local dev server: http://127.0.0.1:$runningServerPort"
         } else {
@@ -471,17 +506,36 @@ class AgentHarnessEngine(
         }
         val systemPrompt = buildString {
             appendLine("You are Torve AI, an expert on-device agentic software engineering harness running on Android.")
-            appendLine("Active workspace: $workspaceName ($workspaceDirPath)")
+            appendLine("Active workspace: $workspaceName (${workspaceDir.absolutePath})")
             appendLine(serverNote)
             appendLine("Current workspace files:")
             appendLine(workspaceTree)
             if (allowTools) {
                 appendLine()
-                appendLine("You have access to 7 sandboxed tools: bash_exec, read_file, write_file, edit_file, list_files, grep_search, manage_dev_server.")
+                appendLine("You have access to 8 sandboxed tools: bash_exec, read_file, write_file, edit_file, list_files, grep_search, manage_dev_server, load_skill.")
                 appendLine("When building web apps or sites:")
                 appendLine("- Write clean, self-contained responsive HTML/CSS/JS files into the workspace using write_file.")
                 appendLine("- Call manage_dev_server(action='start', port=8080) to start the local loopback server so the user can open Live Preview immediately.")
                 appendLine("- Keep responses concise, structured, and helpful.")
+            } else {
+                appendLine()
+                appendLine("This model is currently running in Chat-Only Mode (tool calling is disabled for this model).")
+            }
+
+            if (skillsCatalog.isNotBlank()) {
+                appendLine()
+                appendLine(skillsCatalog)
+            }
+
+            if (injectedSkill != null) {
+                appendLine()
+                appendLine("=== ACTIVE SKILL INSTRUCTIONS: ${injectedSkill.name} ===")
+                appendLine("Description: ${injectedSkill.description}")
+                if (injectedSkill.allowedTools.isNotEmpty()) {
+                    appendLine("Preferred tools: ${injectedSkill.allowedTools.joinToString(", ")}")
+                }
+                appendLine(injectedSkill.instructionsBody)
+                appendLine("=== END ACTIVE SKILL ===")
             }
         }
 
@@ -515,11 +569,5 @@ class AgentHarnessEngine(
             }
         }
         return result
-    }
-
-    private class MutableToolAccumulator {
-        var id: String = ""
-        var name: String = ""
-        val arguments = StringBuilder()
     }
 }

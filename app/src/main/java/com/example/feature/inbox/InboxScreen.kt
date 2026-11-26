@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -105,9 +106,11 @@ import java.util.Locale
 fun InboxScreen(
     viewModel: InboxViewModel,
     sessionState: AccountSessionState,
+    enabledSkillsCount: Int,
     onOpenThread: (String) -> Unit,
     onOpenWorkspaceExplorer: (String) -> Unit,
     onOpenLivePreview: (String, Int) -> Unit,
+    onOpenSkills: () -> Unit,
     onOpenUsage: () -> Unit,
     onOpenSettings: () -> Unit,
     onSignOut: () -> Unit
@@ -222,6 +225,28 @@ fun InboxScreen(
                     modifier = Modifier
                         .padding(NavigationDrawerItemDefaults.ItemPadding)
                         .testTag("drawer_running_servers")
+                )
+
+                NavigationDrawerItem(
+                    label = { Text(stringResource(R.string.nav_skills)) },
+                    icon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
+                    badge = {
+                        if (enabledSkillsCount > 0) {
+                            Text(
+                                text = "$enabledSkillsCount",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TorveCyan
+                            )
+                        }
+                    },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        onOpenSkills()
+                    },
+                    modifier = Modifier
+                        .padding(NavigationDrawerItemDefaults.ItemPadding)
+                        .testTag("drawer_skills")
                 )
 
                 Spacer(Modifier.height(6.dp))

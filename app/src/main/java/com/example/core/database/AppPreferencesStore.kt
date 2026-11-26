@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.core.network.TorveApiClient
 import com.example.core.network.TorveModel
@@ -45,6 +46,10 @@ class AppPreferencesStore(private val context: Context) {
         }.getOrDefault(emptyList())
     }
 
+    val disabledSkillsFlow: Flow<Set<String>> = context.torvePrefsDataStore.data.map { prefs ->
+        prefs[KEY_DISABLED_SKILLS] ?: emptySet()
+    }
+
     suspend fun setThemeMode(mode: ThemeMode) {
         context.torvePrefsDataStore.edit { it[KEY_THEME_MODE] = mode.name }
     }
@@ -66,6 +71,13 @@ class AppPreferencesStore(private val context: Context) {
         context.torvePrefsDataStore.edit { it[KEY_CACHED_MODELS] = serialized }
     }
 
+    suspend fun setSkillEnabled(skillSlug: String, enabled: Boolean) {
+        context.torvePrefsDataStore.edit { prefs ->
+            val current = prefs[KEY_DISABLED_SKILLS] ?: emptySet()
+            prefs[KEY_DISABLED_SKILLS] = if (enabled) current - skillSlug else current + skillSlug
+        }
+    }
+
     suspend fun clearSessionCache() {
         context.torvePrefsDataStore.edit {
             it.remove(KEY_CACHED_MODELS)
@@ -79,5 +91,6 @@ class AppPreferencesStore(private val context: Context) {
         private val KEY_MAX_STEPS = intPreferencesKey("max_agent_steps")
         private val KEY_DEFAULT_MODEL = stringPreferencesKey("default_model_id")
         private val KEY_CACHED_MODELS = stringPreferencesKey("cached_models_json")
+        private val KEY_DISABLED_SKILLS = stringSetPreferencesKey("disabled_skills")
     }
 }

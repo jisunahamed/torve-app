@@ -5,6 +5,7 @@ import com.example.core.network.ToolDefinitionDto
 import com.example.core.network.ToolFunctionSchemaDto
 import com.example.feature.sandbox.LocalDevServerManager
 import com.example.feature.sandbox.SandboxBootstrap
+import com.example.feature.skills.SkillRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -13,7 +14,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.File
@@ -25,17 +25,27 @@ data class ToolExecutionResult(
     val diffContent: String? = null,
     val isError: Boolean = false,
     val durationMs: Long = 0L,
-    val startedServerPort: Int? = null
+    val startedServerPort: Int? = null,
+    val loadedSkillName: String? = null
 )
 
+private sealed class ParsedToolArgs {
+    data class Valid(val obj: JsonObject) : ParsedToolArgs()
+    data class Invalid(val errorJson: String) : ParsedToolArgs()
+}
+
 /**
- * Deterministic 7-tool harness registry exposed to Torve AI models via OpenAI Function Calling.
- * Enforces strict workspace jail confinement and 8,000-char output truncation.
+ * Deterministic 8-tool harness registry exposed to Torve AI models via OpenAI Function Calling:
+ * 7 sandbox tools (`bash_exec`, `read_file`, `write_file`, `edit_file`, `list_files`, `grep_search`,
+ * `manage_dev_server`) + `load_skill` for progressive SKILL.md disclosure.
+ * Enforces strict workspace jail confinement, JSON argument validation with self-correcting
+ * structured error payloads, and 8,000-char output truncation.
  */
 class HarnessToolRegistry(
     private val sandboxBootstrap: SandboxBootstrap,
     private val devServerManager: LocalDevServerManager,
     private val torveDao: TorveDao,
+    private val skillRegistry: SkillRegistry,
     private val json: Json
 ) {
     fun getToolDefinitions(): List<ToolDefinitionDto> = listOf(
@@ -205,11 +215,28 @@ class HarnessToolRegistry(
                     put("required", buildJsonArray { add(JsonPrimitive("action")) })
                 }
             )
+        ),
+        ToolDefinitionDto(
+            function = ToolFunctionSchemaDto(
+                name = "load_skill",
+                description = "Load the full SKILL.md instructions for an enabled modular agent skill by name (e.g., 'web-builder', 'code-debugger', 'api-tester', 'project-explainer').",
+                parameters = buildJsonObject {
+                    put("type", "object")
+                    put("properties", buildJsonObject {
+                        put("name", buildJsonObject {
+                            put("type", "string")
+                            put("description", "Skill slug name from the available skills catalog")
+                        })
+                    })
+                    put("required", buildJsonArray { add(JsonPrimitive("name")) })
+                }
+            )
         )
     )
 
     fun summarizeArguments(toolName: String, argumentsJson: String): String {
-        val args = parseArgs(argumentsJson)
+        val parsed = parseAndValidateArgs(toolName, argumentsJson)
+        val args = (parsed as? ParsedToolArgs.Valid)?.obj ?: return "malformed arguments"
         return when (toolName) {
             "bash_exec" -> args["command"]?.jsonPrimitive?.content?.take(64) ?: "shell command"
             "read_file" -> args["path"]?.jsonPrimitive?.content ?: "file"
@@ -222,6 +249,7 @@ class HarnessToolRegistry(
                 val port = args["port"]?.jsonPrimitive?.intOrNull
                 if (port != null) "$action :$port" else action
             }
+            "load_skill" -> args["name"]?.jsonPrimitive?.content ?: "skill"
             else -> toolName
         }
     }
@@ -235,14 +263,25 @@ class HarnessToolRegistry(
         onLiveOutput: ((String) -> Unit)? = null
     ): ToolExecutionResult = withContext(Dispatchers.IO) {
         val startMs = System.currentTimeMillis()
-        val args = parseArgs(argumentsJson)
         val summary = summarizeArguments(toolName, argumentsJson)
+
+        val args = when (val parsed = parseAndValidateArgs(toolName, argumentsJson)) {
+            is ParsedToolArgs.Valid -> parsed.obj
+            is ParsedToolArgs.Invalid -> {
+                return@withContext ToolExecutionResult(
+                    output = parsed.errorJson,
+                    summary = "invalid JSON",
+                    isError = true,
+                    durationMs = System.currentTimeMillis() - startMs
+                )
+            }
+        }
 
         try {
             when (toolName) {
                 "bash_exec" -> {
                     val command = args["command"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'command'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'command' for bash_exec", summary, startMs)
                     val cwd = args["cwd"]?.jsonPrimitive?.content
                     val timeoutSec = args["timeout_sec"]?.jsonPrimitive?.intOrNull ?: 30
                     val res = sandboxBootstrap.executeShellCommand(
@@ -262,14 +301,21 @@ class HarnessToolRegistry(
 
                 "read_file" -> {
                     val path = args["path"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'path'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'path' for read_file", summary, startMs)
                     val file = sandboxBootstrap.resolveJailedPath(workspaceDir, path)
                     if (!file.exists() || !file.isFile) {
-                        return@withContext errorResult("File not found: $path", summary, startMs)
+                        return@withContext structuredErrorResult("File not found: $path", summary, startMs)
                     }
                     val lines = file.readLines()
-                    val startLine = (args["start_line"]?.jsonPrimitive?.intOrNull ?: 1).coerceAtLeast(1)
-                    val endLine = (args["end_line"]?.jsonPrimitive?.intOrNull ?: lines.size).coerceAtMost(lines.size)
+                    if (lines.isEmpty()) {
+                        return@withContext ToolExecutionResult(
+                            output = "File: $path (0 lines, empty file)",
+                            summary = summary,
+                            durationMs = System.currentTimeMillis() - startMs
+                        )
+                    }
+                    val startLine = (args["start_line"]?.jsonPrimitive?.intOrNull ?: 1).coerceIn(1, lines.size)
+                    val endLine = (args["end_line"]?.jsonPrimitive?.intOrNull ?: lines.size).coerceIn(startLine, lines.size)
                     val formatted = buildString {
                         append("File: $path (${lines.size} lines)\n")
                         for (idx in startLine..endLine) {
@@ -285,9 +331,9 @@ class HarnessToolRegistry(
 
                 "write_file" -> {
                     val path = args["path"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'path'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'path' for write_file", summary, startMs)
                     val content = args["content"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'content'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'content' for write_file", summary, startMs)
                     val file = sandboxBootstrap.resolveJailedPath(workspaceDir, path)
                     val existed = file.exists()
                     val oldContent = if (existed && file.isFile) file.readText() else ""
@@ -310,19 +356,19 @@ class HarnessToolRegistry(
 
                 "edit_file" -> {
                     val path = args["path"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'path'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'path' for edit_file", summary, startMs)
                     val oldStr = args["old_str"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'old_str'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'old_str' for edit_file", summary, startMs)
                     val newStr = args["new_str"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'new_str'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'new_str' for edit_file", summary, startMs)
                     val file = sandboxBootstrap.resolveJailedPath(workspaceDir, path)
                     if (!file.exists() || !file.isFile) {
-                        return@withContext errorResult("File not found: $path", summary, startMs)
+                        return@withContext structuredErrorResult("File not found: $path", summary, startMs)
                     }
                     val current = file.readText()
                     if (!current.contains(oldStr)) {
-                        return@withContext errorResult(
-                            "Target text not found in $path. Read the file first to confirm exact content.",
+                        return@withContext structuredErrorResult(
+                            "Target text not found in $path. Call read_file first to inspect exact content.",
                             summary,
                             startMs
                         )
@@ -343,7 +389,7 @@ class HarnessToolRegistry(
                     val maxDepth = (args["max_depth"]?.jsonPrimitive?.intOrNull ?: 3).coerceIn(1, 6)
                     val root = sandboxBootstrap.resolveJailedPath(workspaceDir, path)
                     if (!root.exists()) {
-                        return@withContext errorResult("Directory not found: ${path ?: "."}", summary, startMs)
+                        return@withContext structuredErrorResult("Directory not found: ${path ?: "."}", summary, startMs)
                     }
                     val tree = buildDirectoryTree(root, maxDepth)
                     ToolExecutionResult(
@@ -355,7 +401,7 @@ class HarnessToolRegistry(
 
                 "grep_search" -> {
                     val patternStr = args["pattern"]?.jsonPrimitive?.content
-                        ?: return@withContext errorResult("Missing required argument 'pattern'", summary, startMs)
+                        ?: return@withContext structuredErrorResult("Missing required argument 'pattern' for grep_search", summary, startMs)
                     val path = args["path"]?.jsonPrimitive?.content
                     val root = sandboxBootstrap.resolveJailedPath(workspaceDir, path)
                     val regex = runCatching { Pattern.compile(patternStr, Pattern.CASE_INSENSITIVE) }.getOrNull()
@@ -374,7 +420,8 @@ class HarnessToolRegistry(
                 }
 
                 "manage_dev_server" -> {
-                    val action = args["action"]?.jsonPrimitive?.content?.lowercase() ?: "status"
+                    val action = args["action"]?.jsonPrimitive?.content?.lowercase()
+                        ?: return@withContext structuredErrorResult("Missing required argument 'action' for manage_dev_server", summary, startMs)
                     val command = args["command"]?.jsonPrimitive?.content
                     val port = args["port"]?.jsonPrimitive?.intOrNull ?: 8080
                     when (action) {
@@ -404,7 +451,7 @@ class HarnessToolRegistry(
                                 durationMs = System.currentTimeMillis() - startMs
                             )
                         }
-                        else -> {
+                        "status" -> {
                             val active = devServerManager.getServerForWorkspace(workspaceId)
                             val msg = if (active != null) {
                                 "Running (${active.mode}) at ${active.previewUrl}\nCommand: ${active.command}\nRecent logs:\n${active.recentLogs.takeLast(8).joinToString("\n")}"
@@ -417,15 +464,59 @@ class HarnessToolRegistry(
                                 durationMs = System.currentTimeMillis() - startMs
                             )
                         }
+                        else -> structuredErrorResult(
+                            "Invalid action '$action' for manage_dev_server. Expected one of: start, stop, status.",
+                            summary,
+                            startMs
+                        )
                     }
                 }
 
-                else -> errorResult("Unknown tool: $toolName", summary, startMs)
+                "load_skill" -> {
+                    val skillName = args["name"]?.jsonPrimitive?.content
+                        ?: return@withContext structuredErrorResult("Missing required argument 'name' for load_skill", summary, startMs)
+                    val skill = skillRegistry.loadSkillByName(skillName, workspaceDir)
+                        ?: return@withContext structuredErrorResult(
+                            "Skill '$skillName' not found or disabled. Available enabled skills: ${
+                                skillRegistry.getEnabledSkills(workspaceDir).joinToString(", ") { it.name }
+                            }",
+                            summary,
+                            startMs
+                        )
+                    val payload = buildString {
+                        appendLine("# Loaded Skill: ${skill.name}")
+                        appendLine("Description: ${skill.description}")
+                        if (skill.allowedTools.isNotEmpty()) {
+                            appendLine("Recommended tools: ${skill.allowedTools.joinToString(", ")}")
+                        }
+                        appendLine()
+                        append(skill.instructionsBody)
+                    }
+                    ToolExecutionResult(
+                        output = truncateOutput(payload),
+                        summary = skill.name,
+                        durationMs = System.currentTimeMillis() - startMs,
+                        loadedSkillName = skill.name
+                    )
+                }
+
+                else -> {
+                    val available = getToolDefinitions().joinToString(", ") { it.function.name }
+                    structuredErrorResult(
+                        "Unknown tool '$toolName'. Available tools: $available",
+                        summary,
+                        startMs
+                    )
+                }
             }
         } catch (se: SecurityException) {
-            errorResult(se.message ?: "Workspace jail violation", summary, startMs)
+            structuredErrorResult(se.message ?: "Workspace jail violation", summary, startMs)
         } catch (e: Exception) {
-            errorResult("Tool error: ${e.localizedMessage ?: e::class.simpleName}", summary, startMs)
+            structuredErrorResult(
+                "Tool execution failed for $toolName: ${e.localizedMessage ?: e::class.simpleName}",
+                summary,
+                startMs
+            )
         }
     }
 
@@ -433,18 +524,37 @@ class HarnessToolRegistry(
         return buildDirectoryTree(workspaceDir, maxDepth = 3).ifBlank { "(empty workspace)" }
     }
 
-    private fun parseArgs(argumentsJson: String): JsonObject {
-        if (argumentsJson.isBlank()) return JsonObject(emptyMap())
-        return runCatching { json.parseToJsonElement(argumentsJson).jsonObject }
-            .getOrDefault(JsonObject(emptyMap()))
+    private fun parseAndValidateArgs(toolName: String, argumentsJson: String): ParsedToolArgs {
+        val trimmed = argumentsJson.trim()
+        if (trimmed.isEmpty()) {
+            return ParsedToolArgs.Valid(JsonObject(emptyMap()))
+        }
+        return try {
+            val element = json.parseToJsonElement(trimmed)
+            if (element is JsonObject) {
+                ParsedToolArgs.Valid(element)
+            } else {
+                ParsedToolArgs.Invalid(
+                    formatJsonError("Invalid JSON arguments for $toolName: expected a JSON object, got ${element::class.simpleName}.")
+                )
+            }
+        } catch (e: Exception) {
+            ParsedToolArgs.Invalid(
+                formatJsonError("Invalid JSON arguments for $toolName: ${e.message ?: "malformed JSON"}. Re-emit valid JSON matching the schema.")
+            )
+        }
     }
 
-    private fun errorResult(message: String, summary: String, startMs: Long) = ToolExecutionResult(
-        output = message,
+    private fun structuredErrorResult(message: String, summary: String, startMs: Long) = ToolExecutionResult(
+        output = formatJsonError(message),
         summary = summary,
         isError = true,
         durationMs = System.currentTimeMillis() - startMs
     )
+
+    private fun formatJsonError(message: String): String {
+        return buildJsonObject { put("error", message) }.toString()
+    }
 
     private fun truncateOutput(text: String): String {
         val max = SandboxBootstrap.MAX_TOOL_OUTPUT_CHARS

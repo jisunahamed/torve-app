@@ -15,16 +15,15 @@ import com.example.core.network.RateLimitBannerState
 import com.example.core.network.TorveModel
 import com.example.feature.harness.HarnessRunState
 import com.example.feature.sandbox.RunningServerInfo
+import com.example.feature.skills.AgentSkill
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 
 data class ChatUiState(
     val thread: ThreadEntity? = null,
@@ -34,6 +33,8 @@ data class ChatUiState(
     val models: List<TorveModel> = emptyList(),
     val selectedModel: TorveModel? = null,
     val selectedModelId: String = "",
+    val supportsTools: Boolean = true,
+    val enabledSkills: List<AgentSkill> = emptyList(),
     val runState: HarnessRunState = HarnessRunState(),
     val rateLimitBanner: RateLimitBannerState? = null,
     val runningServer: RunningServerInfo? = null,
@@ -67,7 +68,11 @@ class ChatViewModel(
         RuntimeDataBundle(session.models, runState, rateLimit, servers, notice)
     }
 
-    val uiState: StateFlow<ChatUiState> = combine(threadBundle, runtimeBundle) { tData, rData ->
+    val uiState: StateFlow<ChatUiState> = combine(
+        threadBundle,
+        runtimeBundle,
+        container.skillRegistry.skills
+    ) { tData, rData, allSkills ->
         val thread = tData.thread
         val resolvedModelId = thread?.modelId?.takeIf { it.isNotBlank() }
             ?: rData.models.firstOrNull { it.supportsTools }?.id
@@ -85,6 +90,8 @@ class ChatViewModel(
             models = rData.models,
             selectedModel = selectedModel,
             selectedModelId = resolvedModelId,
+            supportsTools = selectedModel?.supportsTools ?: true,
+            enabledSkills = allSkills.filter { it.enabled },
             runState = activeRun,
             rateLimitBanner = rData.rateLimit,
             runningServer = server,
@@ -98,6 +105,11 @@ class ChatViewModel(
 
     init {
         viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val thread = container.torveDao.getThreadById(threadId)
+                val wsDir = thread?.let { container.sandboxBootstrap.ensureWorkspaceDir(it.workspaceId) }
+                container.skillRegistry.syncDisabledStateAndRefresh(wsDir)
+            }
             if (container.authRepository.sessionState.value.models.isEmpty()) {
                 container.authRepository.hydrateSession()
             }

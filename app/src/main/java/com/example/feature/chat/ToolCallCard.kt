@@ -545,5 +545,6 @@ private fun iconForTool(toolName: String): ImageVector = when (toolName) {
     "list_files" -> Icons.Filled.FolderOpen
     "grep_search" -> Icons.Filled.Search
     "manage_dev_server" -> Icons.Filled.Dns
+    "load_skill" -> Icons.Filled.AutoAwesome
     else -> Icons.Filled.Build
 }

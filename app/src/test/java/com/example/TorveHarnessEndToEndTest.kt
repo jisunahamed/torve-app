@@ -5,13 +5,17 @@ import com.example.core.database.ThreadEntity
 import com.example.core.database.ToolCallLogEntity
 import com.example.core.database.TorveDao
 import com.example.core.database.WorkspaceEntity
+import com.example.core.network.ChatCompletionRequest
+import com.example.core.network.ChatMessageDto
 import com.example.core.network.RateLimitQueue
 import com.example.core.network.TorveApiClient
 import com.example.core.network.TorveInferenceClient
 import com.example.core.security.PkceManager
 import com.example.feature.harness.HarnessToolRegistry
+import com.example.feature.harness.SseToolCallAccumulator
 import com.example.feature.sandbox.LocalDevServerManager
 import com.example.feature.sandbox.SandboxBootstrap
+import com.example.feature.skills.SkillRegistry
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
@@ -112,8 +116,15 @@ class TorveHarnessEndToEndTest {
         val tempRoot = Files.createTempDirectory("torve_portfolio_e2e").toFile()
         val sandbox = createJvmSandboxBootstrap(tempRoot)
         val serverManager = LocalDevServerManager(sandbox)
+        val skillRegistry = SkillRegistry(sandbox).apply { ensureStarterSkillsInstalled() }
         val fakeDao = InMemoryTorveDao()
-        val registry = HarnessToolRegistry(sandbox, serverManager, fakeDao, TorveApiClient.defaultTorveJson())
+        val registry = HarnessToolRegistry(
+            sandboxBootstrap = sandbox,
+            devServerManager = serverManager,
+            torveDao = fakeDao,
+            skillRegistry = skillRegistry,
+            json = TorveApiClient.defaultTorveJson()
+        )
 
         val wsId = "ws_portfolio_e2e"
         val wsDir = File(tempRoot, wsId).apply { mkdirs() }
@@ -196,6 +207,181 @@ class TorveHarnessEndToEndTest {
             )
             assertFalse("stopRes failed: ${stopRes.output}", stopRes.isError)
             assertNull("Server should be stopped", serverManager.getServerForWorkspace(wsId))
+        } finally {
+            serverManager.stopAllServers()
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `sse tool call accumulator assembles multiple interleaved tool deltas by index`() {
+        val accumulator = SseToolCallAccumulator()
+
+        // First chunk introduces index 0 and index 1 headers
+        accumulator.appendDelta(index = 0, id = "call_1", nameChunk = "write_file", argumentsChunk = "{\"path\":\"a.txt\"")
+        accumulator.appendDelta(index = 1, id = "call_2", nameChunk = "read_file", argumentsChunk = "{\"path\":")
+
+        // Second chunk streams remaining argument fragments interleaved
+        accumulator.appendDelta(index = 0, id = null, nameChunk = null, argumentsChunk = ",\"content\":\"hello\"}")
+        accumulator.appendDelta(index = 1, id = null, nameChunk = null, argumentsChunk = "\"a.txt\"}")
+
+        val calls = accumulator.buildFinalizedToolCalls(stepNumber = 1)
+        assertEquals(2, calls.size)
+        assertEquals("call_1", calls[0].id)
+        assertEquals("write_file", calls[0].function.name)
+        assertEquals("""{"path":"a.txt","content":"hello"}""", calls[0].function.arguments)
+        assertEquals("call_2", calls[1].id)
+        assertEquals("read_file", calls[1].function.name)
+        assertEquals("""{"path":"a.txt"}""", calls[1].function.arguments)
+    }
+
+    @Test
+    fun `openai tools payload attaches tools and tool_choice auto when supported and omits cleanly in chat only mode`() {
+        val tempRoot = Files.createTempDirectory("torve_payload_test").toFile()
+        val sandbox = createJvmSandboxBootstrap(tempRoot)
+        val serverManager = LocalDevServerManager(sandbox)
+        val skillRegistry = SkillRegistry(sandbox)
+        val json = TorveApiClient.defaultTorveJson()
+        val registry = HarnessToolRegistry(sandbox, serverManager, InMemoryTorveDao(), skillRegistry, json)
+
+        try {
+            val tools = registry.getToolDefinitions()
+            val toolNames = tools.map { it.function.name }.toSet()
+            assertEquals(
+                setOf("bash_exec", "read_file", "write_file", "edit_file", "list_files", "grep_search", "manage_dev_server", "load_skill"),
+                toolNames
+            )
+
+            val withToolsJson = json.encodeToString(
+                ChatCompletionRequest.serializer(),
+                ChatCompletionRequest(
+                    model = "torve-pro",
+                    messages = listOf(ChatMessageDto(role = "user", content = "Hi")),
+                    maxTokens = 4096,
+                    tools = tools,
+                    toolChoice = "auto"
+                )
+            )
+            assertTrue(withToolsJson.contains("\"tools\""))
+            assertTrue(withToolsJson.contains("\"tool_choice\":\"auto\""))
+            assertTrue(withToolsJson.contains("\"type\":\"function\""))
+            assertTrue(withToolsJson.contains("\"load_skill\""))
+
+            val chatOnlyJson = json.encodeToString(
+                ChatCompletionRequest.serializer(),
+                ChatCompletionRequest(
+                    model = "torve-chat-only",
+                    messages = listOf(ChatMessageDto(role = "user", content = "Hi")),
+                    maxTokens = 4096,
+                    tools = null,
+                    toolChoice = null
+                )
+            )
+            assertFalse("Chat-only request must omit tools field", chatOnlyJson.contains("\"tools\""))
+            assertFalse("Chat-only request must omit tool_choice field", chatOnlyJson.contains("\"tool_choice\""))
+        } finally {
+            serverManager.stopAllServers()
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `malformed tool json arguments and unknown tools return structured error json without crashing`() = runTest {
+        val tempRoot = Files.createTempDirectory("torve_error_recovery_test").toFile()
+        val sandbox = createJvmSandboxBootstrap(tempRoot)
+        val serverManager = LocalDevServerManager(sandbox)
+        val skillRegistry = SkillRegistry(sandbox).apply { ensureStarterSkillsInstalled() }
+        val registry = HarnessToolRegistry(
+            sandboxBootstrap = sandbox,
+            devServerManager = serverManager,
+            torveDao = InMemoryTorveDao(),
+            skillRegistry = skillRegistry,
+            json = TorveApiClient.defaultTorveJson()
+        )
+        val wsDir = File(tempRoot, "ws_err").apply { mkdirs() }
+
+        try {
+            val malformed = registry.executeTool(
+                workspaceId = "ws_err",
+                workspaceName = "Error Test",
+                workspaceDir = wsDir,
+                toolName = "edit_file",
+                argumentsJson = """{"path": "index.html", "old_str": UNTERMINATED"""
+            )
+            assertTrue("Expected error flag for malformed JSON", malformed.isError)
+            assertTrue("Expected structured JSON error: ${malformed.output}", malformed.output.contains("\"error\""))
+            assertTrue("Expected edit_file mentioned: ${malformed.output}", malformed.output.contains("Invalid JSON arguments for edit_file"))
+
+            val unknown = registry.executeTool(
+                workspaceId = "ws_err",
+                workspaceName = "Error Test",
+                workspaceDir = wsDir,
+                toolName = "non_existent_tool",
+                argumentsJson = """{}"""
+            )
+            assertTrue("Expected error flag for unknown tool", unknown.isError)
+            assertTrue("Expected structured JSON error: ${unknown.output}", unknown.output.contains("Unknown tool"))
+        } finally {
+            serverManager.stopAllServers()
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `modular skills engine installs starter skills matches slash commands supports custom crud and load_skill tool`() = runTest {
+        val tempRoot = Files.createTempDirectory("torve_skills_test").toFile()
+        val sandbox = createJvmSandboxBootstrap(tempRoot)
+        val serverManager = LocalDevServerManager(sandbox)
+        val skillRegistry = SkillRegistry(sandbox).apply { ensureStarterSkillsInstalled() }
+        val registry = HarnessToolRegistry(
+            sandboxBootstrap = sandbox,
+            devServerManager = serverManager,
+            torveDao = InMemoryTorveDao(),
+            skillRegistry = skillRegistry,
+            json = TorveApiClient.defaultTorveJson()
+        )
+        val wsDir = File(tempRoot, "ws_skills").apply { mkdirs() }
+
+        try {
+            // 1. All 4 starter skills exist and are enabled
+            val installed = skillRegistry.scanSkills(wsDir)
+            val names = installed.map { it.name }.toSet()
+            assertTrue(names.containsAll(setOf("web-builder", "code-debugger", "api-tester", "project-explainer")))
+
+            // 2. Slash command matching
+            val match = skillRegistry.matchSlashCommand("/web create a landing page", wsDir)
+            assertNotNull("Expected /web to match web-builder", match)
+            assertEquals("web-builder", match?.first?.name)
+            assertEquals("create a landing page", match?.second)
+
+            // 3. load_skill harness tool returns SKILL.md body & loadedSkillName
+            val loadRes = registry.executeTool(
+                workspaceId = "ws_skills",
+                workspaceName = "Skills Test",
+                workspaceDir = wsDir,
+                toolName = "load_skill",
+                argumentsJson = """{"name":"web-builder"}"""
+            )
+            assertFalse("load_skill failed: ${loadRes.output}", loadRes.isError)
+            assertEquals("web-builder", loadRes.loadedSkillName)
+            assertTrue(loadRes.output.contains("manage_dev_server"))
+
+            // 4. Custom skill creation, toggle off, and deletion
+            val created = skillRegistry.saveCustomSkill(
+                name = "sql-reviewer",
+                description = "Audit SQL migrations for safety.",
+                triggers = listOf("/sql", "review sql"),
+                allowedTools = listOf("read_file", "grep_search"),
+                instructions = "# SQL Reviewer\n1. Check indexes and constraints."
+            )
+            assertEquals("sql-reviewer", created.name)
+            assertNotNull(skillRegistry.matchSlashCommand("/sql check schema.sql", wsDir))
+
+            skillRegistry.setSkillEnabled("sql-reviewer", false, wsDir)
+            assertNull("Disabled skill should not match slash command", skillRegistry.matchSlashCommand("/sql check", wsDir))
+
+            assertTrue("Custom skill should delete cleanly", skillRegistry.deleteSkill(created, wsDir))
+            assertFalse(skillRegistry.scanSkills(wsDir).any { it.name == "sql-reviewer" })
         } finally {
             serverManager.stopAllServers()
             tempRoot.deleteRecursively()
