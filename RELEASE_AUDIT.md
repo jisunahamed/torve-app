@@ -2,15 +2,17 @@
 
 Audit baseline: `3f2c3c8` (`main` at initial checkout). Audit date: 2026-11-27.
 Implementation branch: `jisun/android-release-automation`.
+The subsequent owner push `9026bf9` (Skills Engine integration) was merged into
+the implementation branch before GitHub-hosted build validation.
 
 ## Repository findings
 
 | Area | Baseline finding and implementation |
 | --- | --- |
-| Workflow location | `.github/workflows/android-apk.yml` already existed in the correct directory. There was no root-level `android-apk.yml` to migrate. The existing workflow built only debug APKs and retained Actions artifacts; it is replaced by the release workflow. |
+| Workflow location | `.github/workflows/android-apk.yml` already existed in the correct directory. There was no root-level `android-apk.yml` to migrate. The existing debug-only workflow now provides manual signed-build validation through the reusable release workflow. |
 | Gradle wrapper | Properties existed, but scripts and wrapper JAR were absent. Official Gradle 9.3.1 was downloaded and verified against its published SHA256, then used to generate the wrapper. Distribution checksum and executable bit are included. |
 | Build versions | Baseline AGP 9.1.1, Gradle 9.3.1, Kotlin catalog 2.4.21, KSP 2.3.5, Room 2.7.0. Compatibility must be confirmed by the actual project build, not inferred from version numbers alone. |
-| Java | Java source/target compatibility remains 11; the build runtime is JDK 17. These settings serve different purposes. |
+| Java | Java source/target compatibility remains 11; the CI build/test runtime is JDK 21 (AGP requires at least 17; Robolectric API 36 requires 21). These settings serve different purposes. |
 | Android SDK | Compile SDK is `release(36)` with minor API 1; target 36 and minimum 24. Google's live package catalog contained `platforms;android-36.1` and build tools 36.0.0. |
 | Signing | Release already used `KEYSTORE_PATH`, `STORE_PASSWORD`, `KEY_PASSWORD`, and alias `upload`. That configuration is preserved. Debug separately references an ignored root `debug.keystore`; it is never the production key. |
 | App identity/version | `com.aistudio.torveai.kxtrva`, versionCode 1, versionName 1.0.0. Tag names affect asset names only. |

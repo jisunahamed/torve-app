@@ -58,7 +58,7 @@ Use alias `upload`. Do not use a debug key. Back up the keystore and passwords i
 separate secure locations, including an offline backup; test restoration.
 
 Only after confirming there is no previous production key, generate a permanent
-key **outside the repository**. With JDK 17 on PATH, PowerShell:
+key **outside the repository**. With JDK 21 on PATH, PowerShell:
 
 ```powershell
 $keyDir = Join-Path $env:USERPROFILE 'TorveSigning'
@@ -118,7 +118,7 @@ runners are ephemeral; abrupt runner termination can prevent cleanup execution.
    such as `v1.0.0`, targeting the reviewed commit on main.
 3. Enter the title and release notes, then select **Publish release**.
 4. Watch **Actions → Release signed Android APK**. The `release: published`
-   event builds the exact tag, using JDK 17, Gradle 9.3.1, Android platform 36.1,
+   event builds the exact tag, using JDK 21, Gradle 9.3.1, Android platform 36.1,
    and build tools 36.0.0. It runs debug unit tests and builds `assembleRelease`.
 5. After successful verification, the same release receives
    `Torve-AI-v1.0.0.apk` and `Torve-AI-v1.0.0.apk.sha256` under **Assets**.
@@ -182,7 +182,7 @@ and [workflow token permissions](https://docs.github.com/en/actions/security-for
   `KEY_PASSWORD` privately in the process environment. Do not put values in commands
   saved to shell history. The existing Gradle signing configuration is preserved.
 - SDK errors: check `sdkmanager --list` for `platforms;android-36.1` and
-  `build-tools;36.0.0`, accept licenses, and check JDK 17. CI uses the Android SDK
+  `build-tools;36.0.0`, accept licenses, and check JDK 21. CI uses the Android SDK
   command-line tools supplied by the GitHub-hosted ubuntu-24.04 runner image.
 - Debug builds separately require the ignored root `debug.keystore` because of
   the existing AI Studio configuration. This file is never used for release signing.
